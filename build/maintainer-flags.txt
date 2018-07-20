@@ -1,3 +1,4 @@
+-fPIC
 -Wall
 -Waggregate-return
 -Wdeclaration-after-statement

@@ -390,6 +390,7 @@ _mongoc_linux_distro_scanner_get_distro (char **name, char **version)
 
    *name = NULL;
    *version = NULL;
+   RETURN (false);
 
    _mongoc_linux_distro_scanner_read_key_value_file (
       "/etc/os-release", "NAME", -1, name, "VERSION_ID", -1, version);
