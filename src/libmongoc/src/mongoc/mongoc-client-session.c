@@ -152,23 +152,22 @@ txn_finish (mongoc_client_session_t *session,
 
    /* Transactions Spec: "Drivers MUST retry the commitTransaction command once
     * after it fails with a retryable error", same for abort */
-   error_type = _mongoc_write_error_get_type (&reply_local);
-   if (!r && (err_ptr->domain == MONGOC_ERROR_STREAM ||
-              error_type == MONGOC_WRITE_ERR_RETRY)) {
+   error_type = _mongoc_write_error_get_type (r, err_ptr, &reply_local);
+   if (error_type == MONGOC_WRITE_ERR_RETRY) {
       bson_destroy (&reply_local);
       r = mongoc_client_write_command_with_opts (
          session->client, "admin", &cmd, &opts, &reply_local, err_ptr);
 
-      error_type = _mongoc_write_error_get_type (&reply_local);
+      error_type = _mongoc_write_error_get_type (r, err_ptr, &reply_local);
    }
 
    /* Transactions Spec: "add the UnknownTransactionCommitResult error label
     * when commitTransaction fails with a network error, server selection
     * error, or write concern failed / timeout." */
    if (intent == TXN_COMMIT && reply) {
-      if (!r && (err_ptr->domain == MONGOC_ERROR_STREAM ||
-                 error_type == MONGOC_WRITE_ERR_RETRY ||
-                 error_type == MONGOC_WRITE_ERR_WRITE_CONCERN)) {
+      if ((!r && err_ptr->domain == MONGOC_ERROR_SERVER_SELECTION) ||
+          error_type == MONGOC_WRITE_ERR_RETRY ||
+          error_type == MONGOC_WRITE_ERR_WRITE_CONCERN) {
          bson_copy_to_excluding_noinit (
             &reply_local, reply, "errorLabels", NULL);
          copy_labels_plus_unknown_commit_result (&reply_local, reply);
@@ -720,13 +719,24 @@ mongoc_client_session_start_transaction (mongoc_client_session_t *session,
 
    BSON_ASSERT (session);
 
-   if (session->txn.state == MONGOC_TRANSACTION_STARTING ||
-       session->txn.state == MONGOC_TRANSACTION_IN_PROGRESS) {
+   /* use "switch" so that static checkers ensure we handle all states */
+   switch (session->txn.state) {
+   case MONGOC_TRANSACTION_STARTING:
+   case MONGOC_TRANSACTION_IN_PROGRESS:
       bson_set_error (error,
                       MONGOC_ERROR_TRANSACTION,
                       MONGOC_ERROR_TRANSACTION_INVALID_STATE,
                       "Transaction already in progress");
       RETURN (false);
+   case MONGOC_TRANSACTION_ENDING:
+      MONGOC_ERROR ("starting txn in invalid state MONGOC_TRANSACTION_ENDING");
+      abort ();
+   case MONGOC_TRANSACTION_COMMITTED:
+   case MONGOC_TRANSACTION_COMMITTED_EMPTY:
+   case MONGOC_TRANSACTION_ABORTED:
+   case MONGOC_TRANSACTION_NONE:
+   default:
+      break;
    }
 
    session->server_session->txn_number++;
@@ -756,6 +766,18 @@ mongoc_client_session_start_transaction (mongoc_client_session_t *session,
    session->txn.state = MONGOC_TRANSACTION_STARTING;
 
    RETURN (true);
+}
+
+
+bool
+mongoc_client_session_in_transaction (const mongoc_client_session_t *session)
+{
+   ENTRY;
+
+   BSON_ASSERT (session);
+
+   /* call the internal function, which would allow a NULL session */
+   RETURN (_mongoc_client_session_in_txn (session));
 }
 
 
@@ -790,9 +812,16 @@ mongoc_client_session_commit_transaction (mongoc_client_session_t *session,
       break;
    case MONGOC_TRANSACTION_IN_PROGRESS:
    case MONGOC_TRANSACTION_COMMITTED:
+      /* in MONGOC_TRANSACTION_ENDING we add txnNumber and autocommit: false
+       * to the commitTransaction command, but if it fails with network error
+       * we add UnknownTransactionCommitResult not TransientTransactionError */
+      session->txn.state = MONGOC_TRANSACTION_ENDING;
       r = txn_finish (session, TXN_COMMIT, reply, error);
       session->txn.state = MONGOC_TRANSACTION_COMMITTED;
       break;
+   case MONGOC_TRANSACTION_ENDING:
+      MONGOC_ERROR ("commit called in invalid state MONGOC_TRANSACTION_ENDING");
+      abort ();
    case MONGOC_TRANSACTION_ABORTED:
    default:
       bson_set_error (
@@ -822,6 +851,7 @@ mongoc_client_session_abort_transaction (mongoc_client_session_t *session,
       session->txn.state = MONGOC_TRANSACTION_ABORTED;
       RETURN (true);
    case MONGOC_TRANSACTION_IN_PROGRESS:
+      session->txn.state = MONGOC_TRANSACTION_ENDING;
       /* Transactions Spec: ignore errors from abortTransaction command */
       txn_finish (session, TXN_ABORT, NULL, NULL);
       session->txn.state = MONGOC_TRANSACTION_ABORTED;
@@ -840,6 +870,9 @@ mongoc_client_session_abort_transaction (mongoc_client_session_t *session,
                       MONGOC_ERROR_TRANSACTION_INVALID_STATE,
                       "Cannot call abortTransaction twice");
       RETURN (false);
+   case MONGOC_TRANSACTION_ENDING:
+      MONGOC_ERROR ("abort called in invalid state MONGOC_TRANSACTION_ENDING");
+      abort ();
    case MONGOC_TRANSACTION_NONE:
    default:
       bson_set_error (error,
@@ -880,8 +913,19 @@ _mongoc_client_session_in_txn (const mongoc_client_session_t *session)
       return false;
    }
 
-   return session->txn.state == MONGOC_TRANSACTION_STARTING ||
-          session->txn.state == MONGOC_TRANSACTION_IN_PROGRESS;
+   /* use "switch" so that static checkers ensure we handle all states */
+   switch (session->txn.state) {
+   case MONGOC_TRANSACTION_STARTING:
+   case MONGOC_TRANSACTION_IN_PROGRESS:
+      return true;
+   case MONGOC_TRANSACTION_NONE:
+   case MONGOC_TRANSACTION_ENDING:
+   case MONGOC_TRANSACTION_COMMITTED:
+   case MONGOC_TRANSACTION_COMMITTED_EMPTY:
+   case MONGOC_TRANSACTION_ABORTED:
+   default:
+      return false;
+   }
 }
 
 
@@ -944,6 +988,7 @@ _mongoc_client_session_append_txn (mongoc_client_session_t *session,
       bson_append_bool (cmd, "startTransaction", 16, true);
    /* FALL THROUGH */
    case MONGOC_TRANSACTION_IN_PROGRESS:
+   case MONGOC_TRANSACTION_ENDING:
       bson_append_int64 (
          cmd, "txnNumber", 9, session->server_session->txn_number);
       bson_append_bool (cmd, "autocommit", 10, false);
@@ -1079,7 +1124,7 @@ mongoc_client_session_destroy (mongoc_client_session_t *session)
       EXIT;
    }
 
-   if (_mongoc_client_session_in_txn (session)) {
+   if (mongoc_client_session_in_transaction (session)) {
       mongoc_client_session_abort_transaction (session, NULL);
    }
 

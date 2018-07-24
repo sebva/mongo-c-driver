@@ -137,7 +137,13 @@ _mongoc_n_return (mongoc_cursor_t *cursor)
    /* if a specified limit exists, account for documents already returned. */
    if (limit > 0 && cursor->count) {
       int64_t remaining = limit - cursor->count;
-      BSON_ASSERT (remaining > 0);
+      /* remaining can be 0 if we have retrieved "limit" documents, but still
+       * have a cursor id: SERVER-21086. use nonzero batchSize to fetch final
+       * empty batch and trigger server to close cursor. */
+      if (remaining <= 0) {
+         return 1;
+      }
+
       n_return = BSON_MIN (n_return, remaining);
    }
 
@@ -298,15 +304,6 @@ _mongoc_cursor_new_with_opts (mongoc_client_t *client,
                          MONGOC_ERROR_CURSOR,
                          MONGOC_ERROR_CURSOR_INVALID_CURSOR,
                          "Read preference in a transaction must be primary");
-         GOTO (finish);
-      }
-
-      if (user_prefs) {
-         bson_set_error (
-            &cursor->error,
-            MONGOC_ERROR_CURSOR,
-            MONGOC_ERROR_CURSOR_INVALID_CURSOR,
-            "Cannot set read preferences after starting transaction");
          GOTO (finish);
       }
 

@@ -427,7 +427,7 @@ _mock_server_listening_on (char *server_bind_to)
       opts.ipv6_only = 0;
       ipv4_addr.sin_family = AF_INET;
       ipv4_addr.sin_port = htons (0);
-      inet_pton (AF_INET, "127.0.0.1", &ipv4_addr.sin_addr);
+      BSON_ASSERT (inet_pton (AF_INET, "127.0.0.1", &ipv4_addr.sin_addr));
       opts.bind_addr = &ipv4_addr;
    } else if (strcmp ("ipv6", server_bind_to) == 0) {
       opts.bind_addr_len = sizeof (ipv6_addr);
@@ -435,7 +435,7 @@ _mock_server_listening_on (char *server_bind_to)
       opts.ipv6_only = 1;
       ipv6_addr.sin6_family = AF_INET6;
       ipv6_addr.sin6_port = htons (0);
-      inet_pton (AF_INET6, "::1", &ipv6_addr.sin6_addr);
+      BSON_ASSERT (inet_pton (AF_INET6, "::1", &ipv6_addr.sin6_addr));
       opts.bind_addr = (struct sockaddr_in *) &ipv6_addr;
    } else {
       fprintf (stderr, "bad value of server_bind_to=%s\n", server_bind_to);
@@ -489,7 +489,7 @@ test_topology_scanner_dns_testcase (dns_testcase_t *testcase)
       NULL, NULL, &_test_topology_scanner_dns_helper, testcase, TIMEOUT);
    host_str = bson_strdup_printf (
       "%s:%d", testcase->client_hostname, mock_server_get_port (server));
-   _mongoc_host_list_from_string (&host, host_str);
+   BSON_ASSERT (_mongoc_host_list_from_string (&host, host_str));
    /* we should only have one host. */
    BSON_ASSERT (!host.next);
    bson_free (host_str);
@@ -596,8 +596,8 @@ test_topology_retired_fails_to_initiate (void)
    scanner = mongoc_topology_scanner_new (
       NULL, NULL, &_retired_fails_to_initiate_cb, NULL, TIMEOUT);
 
-   _mongoc_host_list_from_string (&host_list,
-                                  mock_server_get_host_and_port (server));
+   BSON_ASSERT (_mongoc_host_list_from_string (&host_list,
+                                  mock_server_get_host_and_port (server)));
 
    mongoc_topology_scanner_add (scanner, &host_list, 1);
    mongoc_topology_scanner_start (scanner, false);

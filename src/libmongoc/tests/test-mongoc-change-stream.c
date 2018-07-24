@@ -24,6 +24,8 @@
 #include "test-conveniences.h"
 #include "test-libmongoc.h"
 #include "TestSuite.h"
+#include "json-test.h"
+#include "json-test-operations.h"
 
 #define DESTROY_CHANGE_STREAM(cursor_id)                                      \
    do {                                                                       \
@@ -1240,6 +1242,94 @@ test_change_stream_start_at_operation_time (void *test_ctx)
    mongoc_client_destroy (client);
 }
 
+typedef struct {
+   bool has_initiated;
+   bool has_resumed;
+   bson_t agg_reply;
+} resume_at_optime_ctx_t;
+
+#define RESUME_AT_OPTIME_INITIALIZER { false, false, BSON_INITIALIZER}
+
+static void
+_resume_at_optime_started (const mongoc_apm_command_started_t *event)
+{
+   resume_at_optime_ctx_t *ctx;
+
+   ctx =
+      (resume_at_optime_ctx_t *) mongoc_apm_command_started_get_context (event);
+   if (0 != strcmp (mongoc_apm_command_started_get_command_name (event),
+                    "aggregate")) {
+      return;
+   }
+
+   if (!ctx->has_initiated) {
+      ctx->has_initiated = true;
+   } else {
+      bson_value_t replied_optime, sent_optime;
+      ctx->has_resumed = true;
+      /* it should re-use the same optime on resume. */
+      bson_lookup_value (&ctx->agg_reply, "operationTime", &replied_optime);
+      bson_lookup_value (mongoc_apm_command_started_get_command (event),
+                         "pipeline.0.$changeStream.startAtOperationTime",
+                         &sent_optime);
+      BSON_ASSERT (replied_optime.value_type == BSON_TYPE_TIMESTAMP);
+      BSON_ASSERT (match_bson_value (&sent_optime, &replied_optime, NULL));
+      bson_value_destroy (&sent_optime);
+      bson_value_destroy (&replied_optime);
+   }
+}
+
+static void
+_resume_at_optime_succeeded (const mongoc_apm_command_succeeded_t *event)
+{
+   resume_at_optime_ctx_t *ctx;
+
+   ctx = (resume_at_optime_ctx_t *) mongoc_apm_command_succeeded_get_context (
+      event);
+   if (!strcmp (mongoc_apm_command_succeeded_get_command_name (event),
+                "aggregate")) {
+      bson_destroy (&ctx->agg_reply);
+      bson_copy_to (mongoc_apm_command_succeeded_get_reply (event),
+                    &ctx->agg_reply);
+   }
+}
+
+/* A simple test that passing 'startAtOperationTime' does not error. */
+static void
+test_change_stream_resume_at_optime (void *test_ctx)
+{
+   mongoc_client_t *client = test_framework_client_new ();
+   mongoc_collection_t *coll;
+   mongoc_change_stream_t *stream;
+   const bson_t *doc;
+   bson_error_t error;
+   mongoc_apm_callbacks_t *callbacks;
+   resume_at_optime_ctx_t ctx = RESUME_AT_OPTIME_INITIALIZER;
+
+   callbacks = mongoc_apm_callbacks_new ();
+   mongoc_apm_set_command_started_cb (callbacks, _resume_at_optime_started);
+   mongoc_apm_set_command_succeeded_cb (callbacks, _resume_at_optime_succeeded);
+   mongoc_client_set_apm_callbacks (client, callbacks, &ctx);
+   coll = mongoc_client_get_collection (client, "db", "coll");
+   stream = mongoc_collection_watch (coll, tmp_bson ("{'pipeline': []}"), NULL);
+
+   /* set the cursor id to a wrong cursor id so the next getMore fails and
+    * causes a resume. */
+   stream->cursor->cursor_id = 12345;
+
+   (void) mongoc_change_stream_next (stream, &doc);
+   ASSERT_OR_PRINT (!mongoc_change_stream_error_document (stream, &error, NULL),
+                    error);
+   BSON_ASSERT (ctx.has_initiated);
+   BSON_ASSERT (ctx.has_resumed);
+
+   bson_destroy (&ctx.agg_reply);
+   mongoc_change_stream_destroy (stream);
+   mongoc_collection_destroy (coll);
+   mongoc_apm_callbacks_destroy (callbacks);
+   mongoc_client_destroy (client);
+}
+
 /* A simple test of database watch. */
 void
 test_change_stream_database_watch (void *test_ctx)
@@ -1304,19 +1394,165 @@ test_change_stream_client_watch (void *test_ctx)
 }
 
 
-/* Wire version 7 doesn't imply change stream updates are available on the
- * server. We must also check the version number. */
 static int
-_skip_if_no_change_stream_updates (void)
+_skip_if_rs_version_less_than (const char *version)
 {
    if (!TestSuite_CheckLive ()) {
       return 0;
    }
+   if (!test_framework_skip_if_not_replset ()) {
+      return 0;
+   }
    if (test_framework_get_server_version () >=
-       test_framework_str_to_version ("3.8.0")) {
+       test_framework_str_to_version (version)) {
       return 1;
    }
    return 0;
+}
+
+static int
+_skip_if_no_client_watch (void)
+{
+   return _skip_if_rs_version_less_than ("3.8.0");
+}
+
+static int
+_skip_if_no_db_watch (void)
+{
+   return _skip_if_rs_version_less_than ("3.8.0");
+}
+
+static int
+_skip_if_no_start_at_optime (void)
+{
+   return _skip_if_rs_version_less_than ("3.8.0");
+}
+
+typedef struct {
+   mongoc_change_stream_t *change_stream;
+} change_stream_spec_ctx_t;
+
+static void
+change_stream_spec_operation_cb (json_test_ctx_t *ctx,
+                                 const bson_t *test,
+                                 const bson_t *operation)
+{
+   mongoc_collection_t *coll =
+      mongoc_client_get_collection (ctx->client,
+                                    bson_lookup_utf8 (operation, "database"),
+                                    bson_lookup_utf8 (operation, "collection"));
+   json_test_operation (ctx, test, operation, coll, NULL);
+   mongoc_collection_destroy (coll);
+}
+
+static void
+change_stream_spec_before_test_cb (json_test_ctx_t *test_ctx,
+                                   const bson_t *test)
+{
+   change_stream_spec_ctx_t *ctx =
+      (change_stream_spec_ctx_t *) test_ctx->config->ctx;
+   bson_t opts;
+   bson_t pipeline;
+   const char *target = bson_lookup_utf8 (test, "target");
+
+   bson_lookup_doc (test, "changeStreamOptions", &opts);
+   bson_lookup_doc (test, "changeStreamPipeline", &pipeline);
+   if (!strcmp (target, "collection")) {
+      ctx->change_stream =
+         mongoc_collection_watch (test_ctx->collection, &pipeline, &opts);
+   } else if (!strcmp (target, "database")) {
+      ctx->change_stream =
+         mongoc_database_watch (test_ctx->db, &pipeline, &opts);
+   } else if (!strcmp (target, "client")) {
+      ctx->change_stream =
+         mongoc_client_watch (test_ctx->client, &pipeline, &opts);
+   } else {
+      ASSERT_WITH_MSG (false,
+                       "target unknown: \"%s\" in test: %s",
+                       target,
+                       bson_as_json (test, NULL));
+   }
+}
+
+static void
+change_stream_spec_after_test_cb (json_test_ctx_t *test_ctx, const bson_t *test)
+{
+   change_stream_spec_ctx_t *ctx =
+      (change_stream_spec_ctx_t *) test_ctx->config->ctx;
+   bson_error_t error;
+   if (mongoc_change_stream_error_document (ctx->change_stream, &error, NULL)) {
+      int32_t expected_err_code;
+      /* verify that the error code matches the result. */
+      ASSERT_WITH_MSG (
+         bson_has_field (test, "result.error.code"),
+         "Change stream got error: \"%s\" but test does not assert error: %s.",
+         error.message,
+         bson_as_json (test, NULL));
+      expected_err_code = bson_lookup_int32 (test, "result.error.code");
+      ASSERT_CMPINT64 (expected_err_code, ==, (int32_t) error.code);
+   } else {
+      if (bson_has_field (test, "result.success")) {
+         bson_t expected_docs;
+         bson_iter_t expected_iter;
+         bson_t all_changes = BSON_INITIALIZER;
+         int i = 0;
+         const bson_t *doc;
+
+         bson_lookup_doc (test, "result.success", &expected_docs);
+         BSON_ASSERT (bson_iter_init (&expected_iter, &expected_docs));
+
+         /* iterate over the change stream, and verify that the document exists.
+          */
+         while (mongoc_change_stream_next (ctx->change_stream, &doc)) {
+            char *key = bson_strdup_printf ("%d", i);
+            i++;
+            bson_append_document (&all_changes, key, -1, doc);
+            bson_free (key);
+         }
+
+         /* check that everything in the "result.success" array is contained in
+          * our captured changes. */
+         while (bson_iter_next (&expected_iter)) {
+            bson_t expected_doc;
+            match_ctx_t match_ctx = {0};
+
+            match_ctx.errmsg = bson_malloc0 (120);
+            match_ctx.errmsg_len = 120;
+            match_ctx.allow_placeholders = true;
+            match_ctx.retain_dots_in_keys = true;
+            match_ctx.strict_numeric_types = false;
+            bson_iter_bson (&expected_iter, &expected_doc);
+            match_in_array (&expected_doc, &all_changes, &match_ctx);
+            bson_free (match_ctx.errmsg);
+         }
+         bson_destroy (&all_changes);
+      }
+      /* verify no failure. */
+      ASSERT_OR_PRINT (!mongoc_change_stream_error_document (
+                          ctx->change_stream, &error, NULL),
+                       error);
+
+      /* go through the results. */
+   }
+   /* based on results, do something. */
+   /* call a "test ended" callback */
+   /* or easier, just destroy the change stream here. */
+   mongoc_change_stream_destroy (ctx->change_stream);
+}
+
+static void
+test_change_stream_spec_cb (bson_t *scenario)
+{
+   json_test_config_t config = JSON_TEST_CONFIG_INIT;
+   change_stream_spec_ctx_t ctx = {0};
+   config.ctx = &ctx;
+   config.command_started_events_only = true;
+   config.command_monitoring_allow_subset = true;
+   config.before_test_cb = change_stream_spec_before_test_cb;
+   config.after_test_cb = change_stream_spec_after_test_cb;
+   config.run_operation_cb = change_stream_spec_operation_cb;
+   config.scenario = scenario;
+   run_json_general_test (&config);
 }
 
 
@@ -1447,6 +1683,7 @@ test_resume_cases (void)
 void
 test_change_stream_install (TestSuite *suite)
 {
+   char resolved[PATH_MAX];
    TestSuite_AddMockServerTest (
       suite, "/change_stream/pipeline", test_change_stream_pipeline);
 
@@ -1497,7 +1734,7 @@ test_change_stream_install (TestSuite *suite)
                       test_change_stream_live_read_prefs,
                       NULL,
                       NULL,
-                      test_framework_skip_if_not_rs_version_6);
+                      _skip_if_no_start_at_optime);
 
    TestSuite_Add (suite,
                   "/change_stream/server_selection_fails",
@@ -1524,23 +1761,31 @@ test_change_stream_install (TestSuite *suite)
                       NULL,
                       NULL,
                       test_framework_skip_if_not_rs_version_7,
-                      test_framework_skip_if_no_sessions,
                       test_framework_skip_if_no_crypto,
-                      _skip_if_no_change_stream_updates);
+                      _skip_if_no_start_at_optime);
+   TestSuite_AddFull (suite,
+                      "/change_stream/resume_at_optime",
+                      test_change_stream_resume_at_optime,
+                      NULL,
+                      NULL,
+                      test_framework_skip_if_not_rs_version_7,
+                      test_framework_skip_if_no_crypto,
+                      _skip_if_no_start_at_optime);
    TestSuite_AddFull (suite,
                       "/change_stream/database",
                       test_change_stream_database_watch,
                       NULL,
                       NULL,
-                      test_framework_skip_if_not_rs_version_7,
-                      _skip_if_no_change_stream_updates);
+                      _skip_if_no_db_watch);
    TestSuite_AddFull (suite,
                       "/change_stream/client",
                       test_change_stream_client_watch,
                       NULL,
                       NULL,
-                      test_framework_skip_if_not_rs_version_7,
-                      _skip_if_no_change_stream_updates);
+                      _skip_if_no_client_watch);
    TestSuite_AddMockServerTest (
       suite, "/change_stream/resume_with_first_doc", test_resume_cases);
+
+   test_framework_resolve_path (JSON_DIR "/change_streams", resolved);
+   install_json_test_suite (suite, resolved, &test_change_stream_spec_cb);
 }

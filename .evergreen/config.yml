@@ -121,6 +121,7 @@ functions:
         silent: true
         working_dir: "mongoc/src/libbson"
         script: |
+           . ../../.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
            aws s3 cp doc/html s3://mciuploads/${project}/docs/libbson/${CURRENT_VERSION} --recursive --acl public-read --region us-east-1
@@ -139,6 +140,7 @@ functions:
         silent: true
         working_dir: "mongoc/src/libmongoc"
         script: |
+           . ../../.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
            aws s3 cp doc/html s3://mciuploads/${project}/docs/libmongoc/${CURRENT_VERSION} --recursive --acl public-read --region us-east-1
@@ -174,9 +176,9 @@ functions:
            mkdir -p man-page-images
            mv doc/man/*.png man-page-images
 
+           . ./../../.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
-           sudo apt-get install -y awscli
            aws s3 cp man-page-images s3://mciuploads/${project}/man-page-images/libbson/${CURRENT_VERSION} --recursive --acl public-read --region us-east-1
 
            sh ../../.evergreen/man-page-image-list.sh man-page-images > man-page-images/index.html
@@ -207,9 +209,9 @@ functions:
            mkdir -p man-page-images
            mv doc/man/*.png man-page-images
 
+           . ./../../.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
-           sudo apt-get install -y awscli
            aws s3 cp man-page-images s3://mciuploads/${project}/man-page-images/libmongoc/${CURRENT_VERSION} --recursive --acl public-read --region us-east-1
 
            sh ../../.evergreen/man-page-image-list.sh man-page-images > man-page-images/index.html
@@ -230,6 +232,7 @@ functions:
         silent: true
         working_dir: "mongoc"
         script: |
+           . ./.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
            aws s3 cp coverage s3://mciuploads/${project}/${build_variant}/${revision}/${version_id}/${build_id}/coverage/ --recursive --acl public-read --region us-east-1
@@ -243,6 +246,37 @@ functions:
         permissions: public-read
         content_type: text/html
         display_name: "Coverage Report"
+
+  "upload abi report" :
+    - command: shell.exec
+      params:
+        silent: true
+        working_dir: "mongoc"
+        script: |
+           . ./.evergreen/check-awscli.sh
+           export AWS_ACCESS_KEY_ID=${aws_key}
+           export AWS_SECRET_ACCESS_KEY=${aws_secret}
+           aws s3 cp abi-compliance/compat_reports s3://mciuploads/${project}/${build_variant}/${revision}/${version_id}/${build_id}/abi-compliance/compat_reports --recursive --acl public-read --region us-east-1
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file:  mongoc/abi-compliance/compat_reports/libmongoc/X_to_Y/compat_report.html
+        remote_file: ${project}/${build_variant}/${revision}/${version_id}/${build_id}/abi-compliance/compat_reports/libmongoc/X_to_Y/compat_report.html
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: "ABI Report libmongoc"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file:  mongoc/abi-compliance/compat_reports/libbson/X_to_Y/compat_report.html
+        remote_file: ${project}/${build_variant}/${revision}/${version_id}/${build_id}/abi-compliance/compat_reports/libbson/X_to_Y/compat_report.html
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: "ABI Report libbson"
 
   "upload scan artifacts" :
     - command: shell.exec
@@ -260,6 +294,7 @@ functions:
         silent: true
         working_dir: "mongoc"
         script: |
+           . ./.evergreen/check-awscli.sh
            export AWS_ACCESS_KEY_ID=${aws_key}
            export AWS_SECRET_ACCESS_KEY=${aws_secret}
            aws s3 cp scan s3://mciuploads/${project}/${build_variant}/${revision}/${version_id}/${build_id}/scan/ --recursive --acl public-read --region us-east-1
@@ -302,6 +337,43 @@ functions:
         permissions: public-read
         content_type: ${content_type|text/plain}
         display_name: "orchestration.log"
+    # Gather and archive mongo coredumps.
+    - command: shell.exec
+      params:
+        working_dir: "mongoc"
+        script: |
+          # Find all core files from mongodb in orchestration and move to mongoc
+          DIR=MO
+          MDMP_DIR=$DIR
+          [ -d "/cygdrive/c/data/mo" ] && DIR="/cygdrive/c/data/mo"
+          [ -d "/cygdrive/c/mongodb" ] && MDMP_DIR="/cygdrive/c/mongodb"
+          core_files=$(/usr/bin/find -H $MO $MDMP_DIR \( -name "*.core" -o -name "*.mdmp" \) 2> /dev/null)
+          for core_file in $core_files
+          do
+            base_name=$(echo $core_file | sed "s/.*\///")
+            # Move file if it does not already exist
+            if [ ! -f $base_name ]; then
+              mv $core_file .
+            fi
+          done
+    - command: archive.targz_pack
+      params:
+        target: "mongo-coredumps.tgz"
+        source_dir: "mongoc"
+        include:
+          - "./**.core"
+          - "./**.mdmp" # Windows: minidumps
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: mongo-coredumps.tgz
+        remote_file: mongo-c-driver/${build_variant}/${revision}/${version_id}/${build_id}/coredumps/${task_id}-${execution}-coredumps.log
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Core Dumps - Execution ${execution}
+        optional: true
 
   "backtrace":
     - command: shell.exec
@@ -419,13 +491,6 @@ functions:
             chmod +x $i
           done
 
-  "install dependencies":
-    - command: shell.exec
-      params:
-        working_dir: "mongoc"
-        script: |
-              sudo apt-get install -y awscli || true
-
   "prepare kerberos" :
     - command: shell.exec
       params:
@@ -482,7 +547,6 @@ pre:
   - func: "fetch source"
   - func: "windows fix"
   - func: "make files executable"
-  - func: "install dependencies"
   - func: "prepare kerberos"
 
 post:
@@ -579,7 +643,28 @@ tasks:
               export LDFLAGS="-pie -Wl,-z,relro -Wl,-z,now"
               DEBUG=ON CC='${CC}' MARCH='${MARCH}' SNAPPY=OFF ZLIB=OFF sh .evergreen/compile.sh
         - func: "upload build"
+    
+    - name: abi-compliance-check
+      commands:
+        - command: shell.exec
+          type: test
+          params:
+            working_dir: "mongoc"
+            script: |
+              sh .evergreen/abi-compliance-check.sh
 
+        - func: "upload abi report"
+
+        - command: shell.exec
+          type: test
+          params:
+            working_dir: "mongoc"
+            script: |
+              if [ -e ./abi-compliance/abi-error.txt ]; then
+                exit 1
+              else
+                exit 0
+              fi
 
     - name: test-latest-server-hardened
       tags: ["hardened", "latest"]
@@ -902,6 +987,19 @@ tasks:
                   exit 123
                fi
 
+    - name: compile-tracing
+      tags: ["compile", "tracing"]
+      commands:
+        - command: shell.exec
+          type: test
+          params:
+            working_dir: "mongoc"
+            script: |
+              set -o errexit
+              set -o xtrace
+              DEBUG=ON TRACING=ON CC='${CC}' MARCH='${MARCH}'  sh .evergreen/compile.sh
+        - func: "upload build"
+
     - name: release-compile
       tags: ["release-compile"]
       depends_on:
@@ -1208,7 +1306,7 @@ tasks:
             BUILD_NAME: "debug-compile-sspi-winssl"
         - func: "bootstrap mongo-orchestration"
           vars:
-            VERSION: "latest"
+            VERSION: "4.0"
             TOPOLOGY: "replica_set"
             SSL: "winssl"
             AUTH: "auth"
@@ -1429,13 +1527,12 @@ tasks:
           vars:
             AUTH: "noauth"
             URI: "mongodb://localhost/?replicaSet=repl0&retryWrites=true"
-
 # }}}
 
 # Test Matrix {{{
     - name: test-valgrind-latest-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1457,7 +1554,7 @@ tasks:
 
     - name: test-valgrind-4.0-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1479,7 +1576,7 @@ tasks:
 
     - name: test-valgrind-3.6-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1501,7 +1598,7 @@ tasks:
 
     - name: test-valgrind-3.4-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1523,7 +1620,7 @@ tasks:
 
     - name: test-valgrind-3.2-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1545,7 +1642,7 @@ tasks:
 
     - name: test-valgrind-3.0-server-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1567,7 +1664,7 @@ tasks:
 
     - name: test-valgrind-latest-replica-set-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1589,7 +1686,7 @@ tasks:
 
     - name: test-valgrind-4.0-replica-set-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1611,7 +1708,7 @@ tasks:
 
     - name: test-valgrind-3.4-replica-set-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1633,7 +1730,7 @@ tasks:
 
     - name: test-valgrind-3.2-replica-set-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1655,7 +1752,7 @@ tasks:
 
     - name: test-valgrind-3.0-replica-set-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1677,7 +1774,7 @@ tasks:
 
     - name: test-valgrind-latest-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1699,7 +1796,7 @@ tasks:
 
     - name: test-valgrind-4.0-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1721,7 +1818,7 @@ tasks:
 
     - name: test-valgrind-3.6-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1743,7 +1840,7 @@ tasks:
 
     - name: test-valgrind-3.4-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1765,7 +1862,7 @@ tasks:
 
     - name: test-valgrind-3.2-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1787,7 +1884,7 @@ tasks:
 
     - name: test-valgrind-3.0-sharded-noauth-nosasl-nossl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-nossl"
       commands:
@@ -1809,7 +1906,7 @@ tasks:
 
     - name: test-valgrind-latest-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1831,7 +1928,7 @@ tasks:
 
     - name: test-valgrind-4.0-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1853,7 +1950,7 @@ tasks:
 
     - name: test-valgrind-3.6-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1875,7 +1972,7 @@ tasks:
 
     - name: test-valgrind-3.4-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1897,7 +1994,7 @@ tasks:
 
     - name: test-valgrind-3.2-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1919,7 +2016,7 @@ tasks:
 
     - name: test-valgrind-3.0-server-auth-nosasl-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1941,7 +2038,7 @@ tasks:
 
     - name: test-valgrind-latest-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1963,7 +2060,7 @@ tasks:
 
     - name: test-valgrind-4.0-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -1985,7 +2082,7 @@ tasks:
 
     - name: test-valgrind-3.6-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -2007,7 +2104,7 @@ tasks:
 
     - name: test-valgrind-3.4-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -2029,7 +2126,7 @@ tasks:
 
     - name: test-valgrind-3.2-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -2051,7 +2148,7 @@ tasks:
 
     - name: test-valgrind-3.0-sharded-auth-openssl
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-nosasl-openssl"
       commands:
@@ -2073,7 +2170,7 @@ tasks:
 
     - name: test-valgrind-memcheck-server
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-valgrind-memcheck"
       commands:
@@ -2095,7 +2192,7 @@ tasks:
 
     - name: test-valgrind-memcheck-replica-set
       tags: ["test-valgrind"]
-      exec_timeout_secs: 3600
+      exec_timeout_secs: 7200
       depends_on:
         - name: "debug-compile-valgrind-memcheck"
       commands:
@@ -7747,7 +7844,10 @@ buildvariants:
     - ".debug-compile !.sspi .nossl"
     - "debug-compile-valgrind"
     - "debug-compile-no-counters"
+    - "compile-tracing"
     - name: "link-with-cmake"
+#  Don't schedule the ABI checker until dependencies are installed, per CDRIVER-2726
+#   - name: "abi-compliance-check"
     - name: "link-with-cmake-ssl"
     - name: "link-with-cmake-snappy"
     - name: "link-with-cmake-mac"

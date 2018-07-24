@@ -385,7 +385,7 @@ mongoc_collection_aggregate (mongoc_collection_t *collection,       /* IN */
    bson_init (&cursor_opts);
    _mongoc_cursor_flags_to_opts (flags, &cursor_opts, &slave_ok);
    if (opts) {
-      bson_concat (&cursor_opts, opts);
+      bson_concat (&cursor_opts /* destination */, opts /* source */);
    }
 
    created_command = _make_agg_cmd (
@@ -395,7 +395,8 @@ mongoc_collection_aggregate (mongoc_collection_t *collection,       /* IN */
                                     created_command ? &command : NULL,
                                     &cursor_opts,
                                     read_prefs,
-                                    NULL /* read concern */);
+                                    collection->read_prefs,
+                                    NULL);
    bson_destroy (&command);
    bson_destroy (&cursor_opts);
 
@@ -421,20 +422,10 @@ mongoc_collection_aggregate (mongoc_collection_t *collection,       /* IN */
       GOTO (done);
    }
 
-   if (server_id) {
-      /* don't use mongoc_cursor_set_hint, don't want special slaveok logic */
-      cursor->server_id = server_id;
-   }
-
    /* server id isn't enough. ensure we're connected & know wire version */
    server_stream = _mongoc_cursor_fetch_stream (cursor);
    if (!server_stream) {
       GOTO (done);
-   }
-
-   if (!read_prefs && !server_id) {
-      mongoc_read_prefs_destroy (cursor->read_prefs);
-      cursor->read_prefs = mongoc_read_prefs_copy (collection->read_prefs);
    }
 
    if (!_mongoc_read_prefs_validate (cursor->read_prefs, &cursor->error)) {
@@ -1603,12 +1594,8 @@ mongoc_collection_find_indexes_with_opts (mongoc_collection_t *collection,
 
    /* No read preference. Index Enumeration Spec: "run listIndexes on the
     * primary node in replicaSet mode". */
-   cursor = _mongoc_cursor_cmd_new (collection->client,
-                                    collection->ns,
-                                    &cmd,
-                                    opts,
-                                    NULL /* read prefs */,
-                                    NULL /* read concern */);
+   cursor = _mongoc_cursor_cmd_new (
+      collection->client, collection->ns, &cmd, opts, NULL, NULL, NULL);
 
    if (!mongoc_cursor_error (cursor, &error)) {
       _mongoc_cursor_prime (cursor);
@@ -3325,9 +3312,9 @@ retry:
     * a new writable stream and retry. If server selection fails or the selected
     * server does not support retryable writes, fall through and allow the
     * original error to be reported. */
-   if (!ret && is_retryable &&
-       (error->domain == MONGOC_ERROR_STREAM ||
-        _mongoc_write_error_get_type (reply_ptr) == MONGOC_WRITE_ERR_RETRY)) {
+   if (is_retryable &&
+       _mongoc_write_error_get_type (ret, error, reply_ptr) ==
+          MONGOC_WRITE_ERR_RETRY) {
       bson_error_t ignored_error;
 
       /* each write command may be retried at most once */

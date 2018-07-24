@@ -428,7 +428,7 @@ test_mongoc_client_authenticate (void *context)
    uri = gen_good_uri (username, "test");
 
    database = mongoc_client_get_database (admin_client, "test");
-   mongoc_database_remove_user (database, username, &error);
+   (void) mongoc_database_remove_user (database, username, &error);
    bson_init (&roles);
    BCON_APPEND (&roles, "0", "{", "role", "read", "db", "test", "}");
 
@@ -3057,7 +3057,7 @@ test_mongoc_handshake_pool (void)
    mock_server_run (server);
 
    uri = mongoc_uri_copy (mock_server_get_uri (server));
-   mongoc_uri_set_appname (uri, BSON_FUNC);
+   ASSERT (mongoc_uri_set_appname (uri, BSON_FUNC));
 
    pool = mongoc_client_pool_new (uri);
 

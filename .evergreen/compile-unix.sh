@@ -8,11 +8,13 @@ set -o errexit  # Exit the script with error if any of the commands fail
 #       MARCH                   Machine Architecture. Defaults to lowercase uname -m
 #       RELEASE                 Use the fully qualified release archive
 #       DEBUG                   Use debug configure flags
+#       TRACING                 Use function tracing
 #       VALGRIND                Run the test suite through valgrind
 #       CC                      Which compiler to use
 #       ANALYZE                 Run the build through clangs scan-build
 #       COVERAGE                Produce code coverage reports
 #       RDTSCP                  Use Intel RDTSCP instruction
+#       SKIP_TESTS              Skips running the libmongoc tests after compiling
 # Options for CMake:
 #       LIBBSON                 Build against bundled or external libbson
 #       EXTRA_CONFIGURE_FLAGS   Extra configure flags to use
@@ -25,10 +27,12 @@ set -o errexit  # Exit the script with error if any of the commands fail
 # Options for this script.
 RELEASE=${RELEASE:-OFF}
 DEBUG=${DEBUG:-OFF}
+TRACING=${TRACING:-OFF}
 VALGRIND=${VALGRIND:-OFF}
 ANALYZE=${ANALYZE:-OFF}
 COVERAGE=${COVERAGE:-OFF}
 RDTSCP=${RDTSCP:-OFF}
+SKIP_TESTS=${SKIP_TESTS:-OFF}
 ENABLE_SHM_COUNTERS=${ENABLE_SHM_COUNTERS:-AUTO}
 
 # CMake options.
@@ -42,10 +46,12 @@ echo "CFLAGS: $CFLAGS"
 echo "MARCH: $MARCH"
 echo "RELEASE: $RELEASE"
 echo "DEBUG: $DEBUG"
+echo "TRACING: $TRACING"
 echo "VALGRIND: $VALGRIND"
 echo "CC: $CC"
 echo "ANALYZE: $ANALYZE"
 echo "COVERAGE: $COVERAGE"
+echo "SKIP_TESTS: $SKIP_TESTS"
 echo "ZLIB: $ZLIB"
 
 # Get the kernel name, lowercased
@@ -65,6 +71,7 @@ DEBUG_AND_RELEASE_FLAGS="\
    -DENABLE_HTML_DOCS=OFF \
    -DENABLE_MAINTAINER_FLAGS=ON \
    -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF \
+   -DENABLE_TRACING=$TRACING \
    -DENABLE_RDTSCP=$RDTSCP \
    -DCMAKE_PREFIX_PATH=$INSTALL_DIR \
    -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR \
@@ -188,6 +195,12 @@ openssl md5 README.rst || true
 $SCAN_BUILD make -j8 all
 
 ulimit -c unlimited || true
+
+
+# We are done here if we don't want to run the tests.
+if [ "$SKIP_TESTS" = "ON" ]; then
+   exit 0
+fi
 
 # Write stderr to error.log and to console.
 # TODO: valgrind

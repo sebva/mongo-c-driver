@@ -25,7 +25,7 @@ transactions_test_run_operation (json_test_ctx_t *ctx,
    /* expect some warnings from abortTransaction, but don't suppress others: we
     * want to know if any other tests log warnings */
    capture_logs (true);
-   json_test_operation (ctx, test, operation, session);
+   json_test_operation (ctx, test, operation, ctx->collection, session);
    assert_all_captured_logs_have_prefix ("Error in abortTransaction:");
    capture_logs (false);
 }
@@ -108,6 +108,61 @@ test_transactions_supported (void *ctx)
 }
 
 
+static void
+test_in_transaction (void *ctx)
+{
+   mongoc_client_t *client;
+   mongoc_client_session_t *session;
+   mongoc_database_t *db;
+   mongoc_collection_t *collection;
+   bson_t *majority = tmp_bson ("{'writeConcern': {'w': 'majority'}}");
+   bson_t opts = BSON_INITIALIZER;
+   bson_error_t error;
+   bool r;
+
+   client = test_framework_client_new ();
+   mongoc_client_set_error_api (client, 2);
+   db = mongoc_client_get_database (client, "transaction-tests");
+   /* drop and create collection outside of transaction */
+   mongoc_database_write_command_with_opts (
+      db, tmp_bson ("{'drop': 'test'}"), majority, NULL, NULL);
+   collection =
+      mongoc_database_create_collection (db, "test", majority, &error);
+   ASSERT_OR_PRINT (collection, error);
+
+   session = mongoc_client_start_session (client, NULL, &error);
+   ASSERT_OR_PRINT (session, error);
+   r = mongoc_client_session_append (session, &opts, &error);
+   ASSERT_OR_PRINT (r, error);
+   BSON_ASSERT (!mongoc_client_session_in_transaction (session));
+
+   /* commit an empty transaction */
+   r = mongoc_client_session_start_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   BSON_ASSERT (mongoc_client_session_in_transaction (session));
+   r = mongoc_client_session_commit_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   BSON_ASSERT (!mongoc_client_session_in_transaction (session));
+
+   /* commit a transaction with an insert */
+   r = mongoc_client_session_start_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   BSON_ASSERT (mongoc_client_session_in_transaction (session));
+   r = mongoc_collection_insert_one (
+      collection, tmp_bson ("{}"), &opts, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   r = mongoc_client_session_commit_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   BSON_ASSERT (!mongoc_client_session_in_transaction (session));
+
+   bson_destroy (&opts);
+   mongoc_collection_destroy (collection);
+   mongoc_database_destroy (db);
+   mongoc_client_session_destroy (session);
+   mongoc_client_destroy (client);
+}
+
+
 static bool
 hangup_except_ismaster (request_t *request, void *data)
 {
@@ -117,6 +172,7 @@ hangup_except_ismaster (request_t *request, void *data)
    }
 
    mock_server_hangs_up (request);
+   request_destroy (request);
    return true;
 }
 
@@ -178,14 +234,14 @@ _test_transient_txn_err (bool hangup)
       }                                                                  \
    } while (0)
 
-#define TEST_CMD_ERR(_expr)                                                \
-   do {                                                                    \
-      r = (_expr);                                                         \
-      BSON_ASSERT (!r);                                                    \
-      ASSERT_TRANSIENT_LABEL (&reply, _expr);                              \
-      bson_destroy (&reply);                                               \
-      /* clean slate for next test */                                      \
-      memset (&reply, 0, sizeof (reply));                                  \
+#define TEST_CMD_ERR(_expr)                   \
+   do {                                       \
+      r = (_expr);                            \
+      BSON_ASSERT (!r);                       \
+      ASSERT_TRANSIENT_LABEL (&reply, _expr); \
+      bson_destroy (&reply);                  \
+      /* clean slate for next test */         \
+      memset (&reply, 0, sizeof (reply));     \
    } while (0)
 
 
@@ -198,16 +254,16 @@ _test_transient_txn_err (bool hangup)
       memset (&reply, 0, sizeof (reply));     \
    } while (0)
 
-#define TEST_CURSOR_ERR(_cursor_expr)                                         \
-   do {                                                                       \
-      cursor = (_cursor_expr);                                                \
-      r = mongoc_cursor_next (cursor, &doc_out);                              \
-      BSON_ASSERT (!r);                                                       \
-      r = !mongoc_cursor_error_document (cursor, &error, &error_doc);         \
-      BSON_ASSERT (!r);                                                       \
-      BSON_ASSERT (error_doc);                                                \
-      ASSERT_TRANSIENT_LABEL (error_doc, _cursor_expr);                       \
-      mongoc_cursor_destroy (cursor);                                         \
+#define TEST_CURSOR_ERR(_cursor_expr)                                 \
+   do {                                                               \
+      cursor = (_cursor_expr);                                        \
+      r = mongoc_cursor_next (cursor, &doc_out);                      \
+      BSON_ASSERT (!r);                                               \
+      r = !mongoc_cursor_error_document (cursor, &error, &error_doc); \
+      BSON_ASSERT (!r);                                               \
+      BSON_ASSERT (error_doc);                                        \
+      ASSERT_TRANSIENT_LABEL (error_doc, _cursor_expr);               \
+      mongoc_cursor_destroy (cursor);                                 \
    } while (0)
 
    b = tmp_bson ("{'x': 1}");
@@ -285,6 +341,119 @@ test_network_error (void)
 }
 
 
+/* Transactions Spec: Drivers add the "UnknownTransactionCommitResult" to a
+ * server selection error from commitTransaction, even if this is the first
+ * attempt to send commitTransaction. It is true in this case that the driver
+ * knows the result: the transaction is definitely not committed. However, the
+ * "UnknownTransactionCommitResult" label properly communicates to the
+ * application that calling commitTransaction again may succeed.
+ */
+static void
+test_unknown_commit_result (void)
+{
+   mock_server_t *server;
+   mongoc_client_t *client;
+   mongoc_client_session_t *session;
+   mongoc_collection_t *collection;
+   future_t *future;
+   request_t *request;
+   bson_t opts = BSON_INITIALIZER;
+   bson_error_t error;
+   bson_t reply;
+   bool r;
+
+   server = mock_server_new ();
+   mock_server_run (server);
+   rs_response_to_ismaster (
+      server, 7, true /* primary */, false /* tags */, server, NULL);
+
+   client = mongoc_client_new_from_uri (mock_server_get_uri (server));
+   /* allow fast reconnect */
+   client->topology->min_heartbeat_frequency_msec = 0;
+   session = mongoc_client_start_session (client, NULL, &error);
+   ASSERT_OR_PRINT (session, error);
+   r = mongoc_client_session_start_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+   r = mongoc_client_session_append (session, &opts, &error);
+   ASSERT_OR_PRINT (r, error);
+   collection = mongoc_client_get_collection (client, "db", "collection");
+   future = future_collection_insert_one (
+      collection, tmp_bson ("{}"), &opts, NULL, &error);
+   request = mock_server_receives_msg (
+      server, 0, tmp_bson ("{'insert': 'collection'}"), tmp_bson ("{}"));
+   mock_server_replies_ok_and_destroys (request);
+   ASSERT_OR_PRINT (future_get_bool (future), error);
+   future_destroy (future);
+
+   /* test server selection errors have UnknownTransactionCommitResult */
+   mock_server_destroy (server);
+   r = mongoc_client_session_commit_transaction (session, &reply, &error);
+   BSON_ASSERT (!r);
+
+   if (!mongoc_error_has_label (&reply, "UnknownTransactionCommitResult")) {
+      test_error ("Reply lacks UnknownTransactionCommitResult label: %s",
+                  bson_as_json (&reply, NULL));
+   }
+
+   if (mongoc_error_has_label (&reply, "TransientTransactionError")) {
+      test_error ("Reply shouldn't have TransientTransactionError label: %s",
+                  bson_as_json (&reply, NULL));
+   }
+
+   bson_destroy (&reply);
+   bson_destroy (&opts);
+   mongoc_collection_destroy (collection);
+
+   /* warning when trying to end the session */
+   capture_logs (true);
+   mongoc_client_session_destroy (session);
+   mongoc_client_destroy (client);
+}
+
+
+static void
+test_cursor_primary_read_pref (void *ctx)
+{
+   mongoc_client_t *client;
+   mongoc_client_session_t *session;
+   mongoc_collection_t *collection;
+   mongoc_cursor_t *cursor;
+   bson_t opts = BSON_INITIALIZER;
+   mongoc_read_prefs_t *read_prefs;
+   const bson_t *doc;
+   bson_error_t error;
+   bool r;
+
+   client = test_framework_client_new ();
+   collection = get_test_collection (client, "test_cursor_primary_read_pref");
+
+   session = mongoc_client_start_session (client, NULL, &error);
+   ASSERT_OR_PRINT (session, error);
+
+   r = mongoc_client_session_start_transaction (session, NULL, &error);
+   ASSERT_OR_PRINT (r, error);
+
+   r = mongoc_client_session_append (session, &opts, &error);
+   ASSERT_OR_PRINT (r, error);
+
+   read_prefs = mongoc_read_prefs_new (MONGOC_READ_PRIMARY);
+
+   cursor = mongoc_collection_find_with_opts (
+      collection, tmp_bson ("{}"), &opts, read_prefs);
+
+   bson_destroy (&opts);
+   mongoc_read_prefs_destroy (read_prefs);
+   mongoc_collection_destroy (collection);
+
+   ASSERT (!mongoc_cursor_next (cursor, &doc));
+   ASSERT_OR_PRINT (!mongoc_cursor_error (cursor, &error), error);
+
+   mongoc_cursor_destroy (cursor);
+   mongoc_client_session_destroy (session);
+   mongoc_client_destroy (client);
+}
+
+
 void
 test_transactions_install (TestSuite *suite)
 {
@@ -303,6 +472,12 @@ test_transactions_install (TestSuite *suite)
                       test_framework_skip_if_no_sessions,
                       test_framework_skip_if_no_crypto,
                       test_framework_skip_if_mongos);
+   TestSuite_AddFull (suite,
+                      "/transactions/in_transaction",
+                      test_in_transaction,
+                      NULL,
+                      NULL,
+                      test_framework_skip_if_no_txns);
    TestSuite_AddMockServerTest (suite,
                                 "/transactions/server_selection_err",
                                 test_server_selection_error,
@@ -311,4 +486,14 @@ test_transactions_install (TestSuite *suite)
                                 "/transactions/network_err",
                                 test_network_error,
                                 test_framework_skip_if_no_crypto);
+   TestSuite_AddMockServerTest (suite,
+                                "/transactions/unknown_commit_result",
+                                test_unknown_commit_result,
+                                test_framework_skip_if_no_crypto);
+   TestSuite_AddFull (suite,
+                      "/transactions/cursor_primary_read_pref",
+                      test_cursor_primary_read_pref,
+                      NULL,
+                      NULL,
+                      test_framework_skip_if_no_txns);
 }

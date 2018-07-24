@@ -516,7 +516,7 @@ test_insert_null (void)
       mongoc_client_get_collection (client, "test", "test_null_insert");
    ASSERT (collection);
 
-   mongoc_collection_drop (collection, &error);
+   (void) mongoc_collection_drop (collection, &error);
 
    bson_init (&doc);
    bson_append_utf8 (&doc, "hello", 5, "wor\0ld", 6);
@@ -632,7 +632,7 @@ test_insert_many (void)
    collection = get_test_collection (client, "test_insert_many");
    ASSERT (collection);
 
-   mongoc_collection_drop (collection, &error);
+   (void) mongoc_collection_drop (collection, &error);
 
    context = bson_context_new (BSON_CONTEXT_NONE);
    ASSERT (context);

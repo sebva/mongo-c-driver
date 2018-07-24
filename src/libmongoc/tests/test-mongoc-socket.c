@@ -412,13 +412,13 @@ test_mongoc_socket_poll_refusal (void *ctx)
 
    struct sockaddr_in ipv4_addr = {0};
    ipv4_addr.sin_family = AF_INET;
-   inet_pton (AF_INET, "127.0.0.1", &ipv4_addr.sin_addr);
+   BSON_ASSERT (inet_pton (AF_INET, "127.0.0.1", &ipv4_addr.sin_addr));
    ipv4_addr.sin_port = htons (12345);
 
    /* create a new non-blocking socket. */
    sock = mongoc_socket_new (AF_INET, SOCK_STREAM, 0);
 
-   mongoc_socket_connect (
+   (void) mongoc_socket_connect (
       sock, (struct sockaddr *) &ipv4_addr, sizeof (ipv4_addr), 0);
 
    start = bson_get_monotonic_time ();
@@ -431,7 +431,7 @@ test_mongoc_socket_poll_refusal (void *ctx)
    poller->stream = ssock;
 
    while (bson_get_monotonic_time () - start < 5000 * 1000) {
-      mongoc_stream_poll (poller, 1, 10 * 1000);
+      BSON_ASSERT (mongoc_stream_poll (poller, 1, 10 * 1000) > 0);
       if (poller->revents & POLLHUP) {
          break;
       }

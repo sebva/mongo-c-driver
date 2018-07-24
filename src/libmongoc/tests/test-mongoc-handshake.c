@@ -678,7 +678,7 @@ test_handshake_platform_config ()
 #endif
 
 #ifdef MONGOC_TRACE
-   BSON_ASSERT (_get_bit (config_str, MONGOC_TRACE));
+   BSON_ASSERT (_get_bit (config_str, MONGOC_MD_FLAG_TRACE));
 #endif
    /* any excess bits should all be zero. */
    for (i = LAST_MONGOC_MD_FLAG; i < total_bits; i++) {
@@ -711,7 +711,8 @@ test_mongoc_handshake_race_condition (void)
       _reset_handshake ();
 
       for (j = 0; j < 4; ++j) {
-         mongoc_thread_create (&threads[j], &handshake_append_worker, NULL);
+         BSON_ASSERT (
+            !mongoc_thread_create (&threads[j], &handshake_append_worker, NULL));
       }
 
       for (j = 0; j < 4; ++j) {
